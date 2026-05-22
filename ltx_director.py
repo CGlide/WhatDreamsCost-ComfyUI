@@ -1,8 +1,11 @@
+# --- START OF FILE ltx_director.py ---
+
 import logging
 import json
 import base64
 import io as _io
 import math
+import time
 
 import numpy as np
 import torch
@@ -29,6 +32,145 @@ log = logging.getLogger(__name__)
 
 # Custom socket type shared with LTXSequencer
 GuideData = io.Custom("GUIDE_DATA")
+
+
+def _format_timeline_to_text(global_prompt, duration_frames, frame_rate, epsilon, 
+                             custom_width, custom_height, resize_method,
+                             timeline_data, local_prompts, segment_lengths, guide_strength):
+    lines = []
+    lines.append("LTX Director Timeline Export")
+    lines.append("============================")
+    lines.append("")
+    lines.append("=== Global Parameters ===")
+    lines.append(f"Global Prompt:\n{global_prompt}\n")
+    
+    fr = float(frame_rate) if frame_rate else 24.0
+    if fr <= 0: fr = 24.0
+    
+    lines.append(f"Duration: {duration_frames} frames ({(duration_frames / fr):.2f}s @ {fr} FPS)")
+    lines.append(f"Epsilon (Penalty Decay): {epsilon}")
+    
+    if custom_width > 0 or custom_height > 0:
+        lines.append(f"Target Dimensions: {custom_width}x{custom_height} (Resize Method: {resize_method})")
+    else:
+        lines.append("Target Dimensions: Auto (Based on first image)")
+        
+    lines.append("")
+    lines.append("=== Timeline Segments ===")
+    
+    # --- 1. Text Prompts (Extracted from direct inputs) ---
+    locals_list = [p.strip() for p in local_prompts.split("|")] if local_prompts else []
+    lengths_list = [l.strip() for l in segment_lengths.split(",")] if segment_lengths else []
+    
+    if locals_list and any(locals_list):
+        lines.append("\n--- Text Prompts ---")
+        current_frame = 0.0
+        for i, prompt in enumerate(locals_list):
+            try:
+                len_f = float(lengths_list[i]) if i < len(lengths_list) and lengths_list[i] else 0.0
+            except ValueError:
+                len_f = 0.0
+            
+            start_f = current_frame
+            end_f = start_f + len_f
+            
+            start_s = start_f / fr
+            end_s = end_f / fr
+            len_s = len_f / fr
+            
+            lines.append(f"\n[Prompt {i+1}]")
+            lines.append(f"Time: {start_s:.2f}s - {end_s:.2f}s (Duration: {len_s:.2f}s)")
+            lines.append(f"Frames: {start_f:.1f} - {end_f:.1f} (Length: {len_f:.1f})")
+            lines.append(f"Prompt:\n{prompt}")
+            lines.append("-" * 40)
+            
+            current_frame += len_f
+            
+    # --- 2. Images & Audio (Extracted from JSON) ---
+    try:
+        tdata = json.loads(timeline_data) if timeline_data else {}
+        segs = tdata.get("segments", [])
+        
+        img_segs = [s for s in segs if s.get("type", "image") == "image"]
+        img_segs.sort(key=lambda s: float(s.get("start", 0)))
+        if img_segs:
+            lines.append("\n--- Image Guides ---")
+            strengths = [float(x.strip()) for x in guide_strength.split(",")] if guide_strength and guide_strength.strip() else []
+            for i, seg in enumerate(img_segs):
+                start_f = float(seg.get("start", 0))
+                start_s = start_f / fr
+                strength = strengths[i] if i < len(strengths) else 1.0
+                
+                lines.append(f"\n[Image {i+1}]")
+                lines.append(f"Time Inserted: {start_s:.2f}s (Frame {start_f:.1f})")
+                lines.append(f"Guide Strength: {strength}")
+                lines.append("-" * 40)
+                
+        audio_segs = [s for s in segs if s.get("type") == "audio"]
+        audio_segs.sort(key=lambda s: float(s.get("start", 0)))
+        if audio_segs:
+            lines.append("\n--- Audio Segments ---")
+            for i, seg in enumerate(audio_segs):
+                start_f = float(seg.get("start", 0))
+                len_f = float(seg.get("length", 0))
+                start_s = start_f / fr
+                len_s = len_f / fr
+                file_name = seg.get("fileName", "Unknown")
+                lines.append(f"\n[Audio {i+1}] {file_name}")
+                lines.append(f"Time: {start_s:.2f}s (Frame {start_f:.1f}) | Duration: {len_s:.2f}s")
+                lines.append("-" * 40)
+                
+    except Exception as e:
+        lines.append(f"\n[Note: Could not parse detailed timeline JSON for images/audio. Error: {e}]")
+        
+    return "\n".join(lines)
+
+
+# Register API endpoint for instant export from the JS UI if needed
+try:
+    import server
+    from aiohttp import web
+
+    @server.PromptServer.instance.routes.post("/ltx_director/export_timeline")
+    async def export_timeline_endpoint(request):
+        try:
+            data = await request.json()
+            global_prompt = data.get("global_prompt", "")
+            timeline_data = data.get("timeline_data", "{}")
+            duration_frames = int(data.get("duration_frames", 0))
+            frame_rate = float(data.get("frame_rate", 24))
+            epsilon = float(data.get("epsilon", 0.001))
+            custom_width = int(data.get("custom_width", 0))
+            custom_height = int(data.get("custom_height", 0))
+            resize_method = data.get("resize_method", "maintain aspect ratio")
+            local_prompts = data.get("local_prompts", "")
+            segment_lengths = data.get("segment_lengths", "")
+            guide_strength = data.get("guide_strength", "")
+            
+            formatted_text = _format_timeline_to_text(
+                global_prompt, duration_frames, frame_rate, epsilon, 
+                custom_width, custom_height, resize_method,
+                timeline_data, local_prompts, segment_lengths, guide_strength
+            )
+            
+            out_dir = folder_paths.get_output_directory()
+            filename = f"ltx_director_prompts_{int(time.time())}.txt"
+            filepath = os.path.join(out_dir, filename)
+            
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(formatted_text)
+                
+            return web.json_response({
+                "status": "success", 
+                "filepath": filepath, 
+                "filename": filename, 
+                "content": formatted_text
+            })
+        except Exception as e:
+            log.error(f"[PromptRelay] Export timeline endpoint error: {e}")
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+except Exception as e:
+    log.warning(f"[PromptRelay] Could not register /ltx_director/export_timeline endpoint: {e}")
 
 
 def _load_image_tensor(seg: dict) -> torch.Tensor:
@@ -389,73 +531,27 @@ class LTXDirector(io.ComfyNode):
                 io.Clip.Input("clip"),
                 io.Vae.Input("audio_vae", optional=True, tooltip="Optional. Connect an Audio VAE to generate audio latents."),
                 io.Latent.Input("optional_latent", optional=True, tooltip="Optional. Connect a latent to override the auto-generated one."),
-                io.String.Input(
-                    "global_prompt", multiline=True, default="",
-                    tooltip="Conditions the entire video. Anchors persistent characters, objects, and scene context.",
-                ),
-                io.Int.Input(
-                    "duration_frames", default=120, min=1, max=10000, step=1,
-                    tooltip="Total timeline length in pixel-space frames. Used by the editor for visual scale only.",
-                ),
-                io.Float.Input(
-                    "duration_seconds", default=5, min=0.1, max=1000.0, step=0.01,
-                    tooltip="Total timeline duration in seconds (computed/synced from frames).",
-                ),
-                io.String.Input(
-                    "timeline_data", default="",
-                    tooltip="JSON state of the timeline editor (auto-managed; do not edit by hand).",
-                ),
-                io.Boolean.Input(
-                    "use_custom_audio", default=False, optional=True,
-                    tooltip="Toggle between using timeline audio (ON) and generating audio from scratch (OFF).",
-                ),
-                io.String.Input(
-                    "local_prompts", multiline=True, default="",
-                    tooltip="Auto-populated from the timeline editor.",
-                ),
-                io.String.Input(
-                    "segment_lengths", default="",
-                    tooltip="Auto-populated from the timeline editor (pixel-space frame counts).",
-                ),
-                io.Float.Input(
-                    "epsilon", default=0.001, min=0.0001, max=0.99, step=0.0001,
-                    tooltip="Penalty decay parameter. Values below ~0.1 all produce sharp boundaries (paper default 0.001). For softer transitions, try 0.5 or higher.",
-                ),
-                io.Float.Input(
-                    "frame_rate", default=24, min=1, max=240, step=1, optional=True,
-                    tooltip="Frames per second — only affects how time is displayed in the timeline editor when time_units is set to 'seconds'.",
-                ),
-                io.Combo.Input(
-                    "display_mode", options=["frames", "seconds"], default="seconds", optional=True,
-                    tooltip="Display the ruler, segment ranges, length input, and total in frames or seconds. Internal storage is always pixel-space frames.",
-                ),
-                io.String.Input(
-                    "guide_strength", default="",
-                    tooltip="Auto-populated from the timeline editor (comma-separated guide strengths for image segments).",
-                ),
-                io.Int.Input(
-                    "custom_width", default=0, min=0, max=8192, step=1, optional=True,
-                    tooltip="Target output width for all image segments. Set to 0 to use the original image width.",
-                ),
-                io.Int.Input(
-                    "custom_height", default=0, min=0, max=8192, step=1, optional=True,
-                    tooltip="Target output height for all image segments. Set to 0 to use the original image height.",
-                ),
-                io.Combo.Input(
-                    "resize_method",
-                    options=["maintain aspect ratio", "stretch to fit", "pad", "crop"],
-                    default="maintain aspect ratio",
-                    optional=True,
-                    tooltip="How to resize image segments to fit the target dimensions.",
-                ),
-                io.Int.Input(
-                    "divisible_by", default=32, min=1, max=256, step=1, optional=True,
-                    tooltip="Snap the final output image dimensions to be divisible by this number (e.g. 32 for LTX).",
-                ),
-                io.Int.Input(
-                    "img_compression", default=18, min=0, max=100, step=1, optional=True,
-                    tooltip="H.264 CRF compression to apply to each guide image. 0 = no compression, higher = more artefacts.",
-                ),
+                io.String.Input("global_prompt", multiline=True, default="", tooltip="Conditions the entire video. Anchors persistent characters, objects, and scene context."),
+                io.Int.Input("duration_frames", default=120, min=1, max=10000, step=1, tooltip="Total timeline length in pixel-space frames. Used by the editor for visual scale only."),
+                io.Float.Input("duration_seconds", default=5.0, min=0.1, max=1000.0, step=0.01, tooltip="Total timeline duration in seconds (computed/synced from frames)."),
+                io.String.Input("timeline_data", default="", tooltip="JSON state of the timeline editor (auto-managed; do not edit by hand)."),
+                io.Boolean.Input("use_custom_audio", default=False, tooltip="Toggle between using timeline audio (ON) and generating audio from scratch (OFF)."),
+                io.String.Input("local_prompts", multiline=True, default="", tooltip="Auto-populated from the timeline editor."),
+                io.String.Input("segment_lengths", default="", tooltip="Auto-populated from the timeline editor (pixel-space frame counts)."),
+                io.Float.Input("epsilon", default=0.001, min=0.0001, max=0.99, step=0.0001, tooltip="Penalty decay parameter. Values below ~0.1 all produce sharp boundaries (paper default 0.001). For softer transitions, try 0.5 or higher."),
+                io.Float.Input("frame_rate", default=24.0, min=1.0, max=240.0, step=1.0, tooltip="Frames per second — only affects how time is displayed in the timeline editor when time_units is set to 'seconds'."),
+                io.Combo.Input("display_mode", options=["frames", "seconds"], default="seconds", tooltip="Display the ruler, segment ranges, length input, and total in frames or seconds. Internal storage is always pixel-space frames."),
+                io.String.Input("guide_strength", default="", tooltip="Auto-populated from the timeline editor (comma-separated guide strengths for image segments)."),
+                io.Int.Input("custom_width", default=0, min=0, max=8192, step=1, tooltip="Target output width for all image segments. Set to 0 to use the original image width."),
+                io.Int.Input("custom_height", default=0, min=0, max=8192, step=1, tooltip="Target output height for all image segments. Set to 0 to use the original image height."),
+                io.Combo.Input("resize_method", options=["maintain aspect ratio", "stretch to fit", "pad", "crop"], default="maintain aspect ratio", tooltip="How to resize image segments to fit the target dimensions."),
+                io.Int.Input("divisible_by", default=32, min=1, max=256, step=1, tooltip="Snap the final output image dimensions to be divisible by this number (e.g. 32 for LTX)."),
+                io.Int.Input("img_compression", default=18, min=0, max=100, step=1, tooltip="H.264 CRF compression to apply to each guide image. 0 = no compression, higher = more artefacts."),
+                io.Boolean.Input("save_prompts_to_file", default=False, optional=True, tooltip="Save the timeline prompts and parameters to a text file in your ComfyUI output directory during execution."),
+                io.Image.Input("reference_image", optional=True, tooltip="Invisible character sheet/style reference. Can also be a Batch of images. Automatically appended to the sequence out-of-bounds."),
+                io.Image.Input("reference_image_2", optional=True, tooltip="Second optional reference image."),
+                io.Image.Input("reference_image_3", optional=True, tooltip="Third optional reference image."),
+                io.Float.Input("reference_strength", default=1.0, min=0.0, max=5.0, step=0.05, optional=True, tooltip="Guide strength for the reference images."),
             ],
             outputs=[
                 io.Model.Output(display_name="model"),
@@ -465,20 +561,35 @@ class LTXDirector(io.ComfyNode):
                 GuideData.Output(display_name="guide_data"),
                 io.Float.Output(display_name="frame_rate", tooltip="The frame rate used for the timeline."),
                 io.Audio.Output(display_name="combined_audio", tooltip="Combined timeline audio layout."),
+                io.Int.Output(display_name="clean_latent_frames", tooltip="Plug this into a CleanLatentSlice node 'length' to effortlessly cut off the invisible reference image."),
+                io.Int.Output(display_name="clean_pixel_frames", tooltip="Plug this into your Video Combine 'frame_load_cap' to effortlessly cut off the invisible reference image."),
             ],
         )
 
     @classmethod
     def execute(cls, model, clip, global_prompt, duration_frames, duration_seconds,
                 timeline_data, local_prompts, segment_lengths, guide_strength="", epsilon=1e-3,
-                frame_rate=24, display_mode="seconds",
+                frame_rate=24.0, display_mode="seconds",
                 custom_width=768, custom_height=512, resize_method="maintain aspect ratio",
                 divisible_by=32, img_compression=0, audio_vae=None, optional_latent=None,
-                use_custom_audio=False) -> io.NodeOutput:
+                use_custom_audio=False, save_prompts_to_file=False,
+                reference_image=None, reference_image_2=None, reference_image_3=None, reference_strength=1.0) -> io.NodeOutput:
+
+        # --- Calculate Clean Output Bounds First ---
+        clean_pixel_frames = duration_frames + 1
+        clean_latent_frames = ((clean_pixel_frames - 1) // 8) + 1
 
         # --- Build guide_data from image segments FIRST (to derive output dimensions) ---
-        guide_data = {"images": [], "insert_frames": [], "strengths": [], "frame_rate": frame_rate}
+        guide_data = {"images": [], "insert_frames": [], "strengths": [], "frame_rate": float(frame_rate)}
         derived_w, derived_h = custom_width, custom_height
+        
+        # Consolidate all reference inputs into a flat list, unraveling any image batches.
+        refs_to_process = []
+        for ref_input in (reference_image, reference_image_2, reference_image_3):
+            if ref_input is not None:
+                for i in range(ref_input.shape[0]):
+                    refs_to_process.append(ref_input[i:i+1])
+                    
         try:
             tdata = json.loads(timeline_data) if timeline_data else {}
             img_segs = [
@@ -536,7 +647,7 @@ class LTXDirector(io.ComfyNode):
             
             # If no images were loaded from the timeline, create a dummy image at strength 0
             # to prevent artifacts in text-to-video mode.
-            if not guide_data["images"]:
+            if not guide_data["images"] and not refs_to_process:
                 w = derived_w if derived_w > 0 else 768
                 h = derived_h if derived_h > 0 else 512
                 w = (w // 32) * 32
@@ -552,21 +663,60 @@ class LTXDirector(io.ComfyNode):
         except Exception as e:
             log.warning("[PromptRelay] Could not build guide_data: %s", e)
 
-        # --- Auto-generate LTXV latent if none was provided ---
-        ltxv_length = duration_frames + 1
+        # --- Handle Reference Image Injection ---
+        if refs_to_process:
+            if optional_latent is not None:
+                log.warning("[PromptRelay] You connected reference images AND an external 'optional_latent'. Make sure your custom latent is long enough to fit the appended reference frames!")
+
+            for i, single_ref in enumerate(refs_to_process):
+                src_h, src_w = single_ref.shape[1], single_ref.shape[2]
+                def snap(val, div): return max(div, (val // div) * div)
+                
+                if custom_width > 0 and custom_height > 0:
+                    ref_tensor = _resize_image(single_ref, custom_width, custom_height, resize_method, divisible_by)
+                elif custom_width > 0:
+                    tgt_w = snap(custom_width, divisible_by)
+                    tgt_h = snap(int(src_h * tgt_w / src_w), divisible_by)
+                    ref_tensor = _resize_image(single_ref, tgt_w, tgt_h, "stretch to fit", divisible_by)
+                elif custom_height > 0:
+                    tgt_h = snap(custom_height, divisible_by)
+                    tgt_w = snap(int(src_w * tgt_h / src_h), divisible_by)
+                    ref_tensor = _resize_image(single_ref, tgt_w, tgt_h, "stretch to fit", divisible_by)
+                else:
+                    ref_tensor = _resize_image(single_ref, src_w, src_h, "maintain aspect ratio", divisible_by)
+                
+                if img_compression > 0:
+                    ref_tensor = _compress_image(ref_tensor, img_compression)
+                    
+                guide_data["images"].append(ref_tensor)
+                
+                # Insert safely in the "hidden" padded latent blocks
+                # We place each ref 8 frames apart so they each get their own pure latent block.
+                insert_point = (clean_latent_frames + i) * 8
+                guide_data["insert_frames"].append(insert_point)
+                guide_data["strengths"].append(float(reference_strength))
+                
+                # Record dimensions for empty latent generation from the FIRST reference image if none exist
+                if derived_w <= 0 or derived_h <= 0:
+                    derived_w = ref_tensor.shape[2]
+                    derived_h = ref_tensor.shape[1]
+
+        # --- Auto-generate LTXV latent ---
+        total_latents = clean_latent_frames + len(refs_to_process)
+        ltxv_length = ((total_latents - 1) * 8) + 1  # Map back to pixel frames for the empty latent logic
+
         if optional_latent is None:
             latent_w = max(32, (derived_w // 32) * 32)
             latent_h = max(32, (derived_h // 32) * 32)
-            # LTXV temporal: ((length - 1) // 8) + 1 latent frames; invert to get pixel frames -> length
-            latent_t = ((ltxv_length - 1) // 8) + 1
+            
             samples = torch.zeros(
-                [1, 128, latent_t, latent_h // 32, latent_w // 32],
+                [1, 128, total_latents, latent_h // 32, latent_w // 32],
                 device=comfy.model_management.intermediate_device(),
             )
             latent = {"samples": samples}
             log.info(
-                "[PromptRelay] Auto-generated LTXV latent: %dx%d, %d pixel frames (%d latent frames)",
-                latent_w, latent_h, ltxv_length, latent_t,
+                "[PromptRelay] Auto-generated LTXV latent: %dx%d, %d pixel frames (%d latent frames, %d refs hidden)",
+                latent_w, latent_h, ltxv_length, total_latents, len(refs_to_process)
             )
         else:
             latent = optional_latent
@@ -582,7 +732,6 @@ class LTXDirector(io.ComfyNode):
         audio_latent = {}
         
         if audio_vae is not None:
-            # Helper to generate empty latent
             def get_empty_latent():
                 # Support both raw AudioVAE objects and ComfyUI VAE wrappers.
                 inner = getattr(audio_vae, "first_stage_model", audio_vae)
@@ -598,17 +747,12 @@ class LTXDirector(io.ComfyNode):
             if use_custom_audio:
                 try:
                     if audio_out is not None:
-                        # 1. Encode audio waveform into latent space
                         waveform = audio_out["waveform"]
                         if waveform.ndim == 2:
                             waveform = waveform.unsqueeze(0)
                         if waveform.ndim != 3:
-                            raise ValueError(
-                                f"Expected custom audio waveform with 2 or 3 dims, got shape {tuple(waveform.shape)}"
-                            )
+                            raise ValueError(f"Expected custom audio waveform with 2 or 3 dims, got shape {tuple(waveform.shape)}")
 
-                        # Wrapped ComfyUI VAE expects (batch, samples, channels);
-                        # raw AudioVAE expects a dict with waveform in (batch, channels, samples).
                         if hasattr(audio_vae, "first_stage_model"):
                             latent_samples = audio_vae.encode(waveform.movedim(1, -1))
                         else:
@@ -620,7 +764,6 @@ class LTXDirector(io.ComfyNode):
                         if latent_samples.numel() == 0:
                             raise ValueError("Encoded audio latent is empty (0 elements).")
                         
-                        # 2. Create solid mask with value 0.0 (0 means keep/use conditioning, 1 means generate noise)
                         mask = torch.full(
                             (1, latent_samples.shape[-2], latent_samples.shape[-1]), 
                             0.0, 
@@ -628,7 +771,6 @@ class LTXDirector(io.ComfyNode):
                             device=comfy.model_management.intermediate_device()
                         )
                         
-                        # 3. Set Latent Noise Mask
                         audio_latent = {
                             "samples": latent_samples,
                             "type": "audio",
@@ -641,7 +783,6 @@ class LTXDirector(io.ComfyNode):
                     log.error("[PromptRelay] Failed to generate custom audio latent: %s", e)
                     raise e
             else:
-                # Generate empty latent
                 try:
                     audio_latent = get_empty_latent()
                     log.info("[PromptRelay] Auto-generated empty audio latent.")
@@ -649,7 +790,34 @@ class LTXDirector(io.ComfyNode):
                     log.error("[PromptRelay] Could not generate empty audio latent: %s", e)
                     raise e
 
-        return io.NodeOutput(patched, conditioning, latent, audio_latent, guide_data, float(frame_rate), audio_out)
+        # --- Save formatted Prompts logic ---
+        if save_prompts_to_file:
+            try:
+                formatted_text = _format_timeline_to_text(
+                    global_prompt, duration_frames, float(frame_rate), epsilon,
+                    custom_width, custom_height, resize_method,
+                    timeline_data, local_prompts, segment_lengths, guide_strength
+                )
+                out_dir = folder_paths.get_output_directory()
+                filename = f"ltx_director_prompts_{int(time.time())}.txt"
+                filepath = os.path.join(out_dir, filename)
+                with open(filepath, "w", encoding="utf-8") as f:
+                    f.write(formatted_text)
+                log.info(f"[PromptRelay] Saved timeline prompts to {filepath}")
+            except Exception as e:
+                log.warning(f"[PromptRelay] Failed to save prompts to txt: {e}")
+
+        return io.NodeOutput(
+            patched, 
+            conditioning, 
+            latent, 
+            audio_latent, 
+            guide_data, 
+            float(frame_rate), 
+            audio_out, 
+            clean_latent_frames, 
+            clean_pixel_frames
+        )
 
 
 NODE_CLASS_MAPPINGS = {
