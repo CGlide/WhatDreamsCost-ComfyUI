@@ -8,6 +8,7 @@ from .ltx_director import LTXDirector
 from .ltx_director_guide import LTXDirectorGuide
 from comfy_api.latest import ComfyExtension, io
 from typing_extensions import override
+from .latent_slice import CleanLatentSlice
 
 class PromptRelay(ComfyExtension):
     @override
@@ -29,6 +30,7 @@ NODE_CLASS_MAPPINGS = {
     "LoadVideoUI": LoadVideoUI,
     "LTXDirector": LTXDirector,
     "LTXDirectorGuide": LTXDirectorGuide,
+    "CleanLatentSlice": CleanLatentSlice,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -40,6 +42,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LoadVideoUI": "Load Video UI",
     "LTXDirector": "LTX Director",
     "LTXDirectorGuide": "LTX Director Guide",
+    "CleanLatentSlice": "Clean Latent Slice",
 }
 
 WEB_DIRECTORY = "./js"
